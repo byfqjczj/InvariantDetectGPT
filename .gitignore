@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+data/raw/
+generation/generated/
+features/extracted/
+*.pt
