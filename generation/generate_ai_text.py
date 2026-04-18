@@ -31,11 +31,12 @@ app = modal.App("ai-text-generation", image=image)
 hf_secret = modal.Secret.from_name("huggingface-secret")
 
 GENERATORS = {
-    "mistral-7b":  "mistralai/Mistral-7B-Instruct-v0.3",
-    "qwen-7b":     "Qwen/Qwen2-7B-Instruct",
-    "gemma-7b":    "google/gemma-7b-it",
-    "phi-3-mini":  "microsoft/Phi-3-mini-4k-instruct",
-    "deepseek-7b": "deepseek-ai/deepseek-llm-7b-chat",
+    "mistral-7b":   "mistralai/Mistral-7B-Instruct-v0.3",
+    "qwen-7b":      "Qwen/Qwen2-7B-Instruct",
+    "gemma-7b":     "google/gemma-7b-it",
+    "phi-3-mini":   "microsoft/Phi-3-mini-4k-instruct",
+    "deepseek-7b":  "deepseek-ai/deepseek-llm-7b-chat",
+    "llama2-13b":   "meta-llama/Llama-2-13b-chat-hf",
 }
 
 DATASETS = ["xsum", "writingprompts", "squad"]
