@@ -15,6 +15,8 @@ generation/test_one.py
 # Evaluation experiments (not part of core submission)
 evaluation/
 
+training/results.json
+
 # Training ablation variants and their results/writeups
 training/train_domain_split.py
 training/train_pangram_invariant.py
