@@ -1,8 +1,8 @@
 """
 Generate AI text counterparts for each human sample using Modal GPU instances.
 
-Training generators:  Mistral-7B, Qwen-7B  (LLaMA-3-8B pending HF approval)
-Held-out generators:  Gemma-7B, Phi-3-mini, DeepSeek-7B
+Training generators:  Mistral-7B, Qwen-7B, Gemma-7B
+Held-out generators:  DeepSeek-7B, Phi-3-mini, LLaMA-2-13B
 
 Uses @app.cls so each model is loaded ONCE per container and reused across
 all batches/datasets — 5 containers total instead of thousands.

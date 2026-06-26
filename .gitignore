@@ -5,3 +5,25 @@ data/raw/
 generation/generated/
 features/extracted/
 *.pt
+
+SUBMISSIONS.pdf
+features_visualization.png
+blog1.md
+features/visualize.py
+generation/test_one.py
+
+# Evaluation experiments (not part of core submission)
+evaluation/
+
+# Training ablation variants and their results/writeups
+training/train_domain_split.py
+training/train_pangram_invariant.py
+training/train_deep_encoder.py
+training/train_no_contrastive.py
+training/results_domain_split.json
+training/results_pangram_invariant.json
+training/results_deep_encoder.json
+training/results_no_contrastive.json
+training/writeup.md
+training/writeup_deep_encoder.md
+training/writeup_no_contrastive.md

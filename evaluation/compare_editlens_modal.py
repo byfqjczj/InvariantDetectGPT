@@ -1,43 +1,32 @@
 """
-Modal version of compare_editlens.py.
+Compare EditLens RoBERTa vs our domain-split detector on the Wikipedia/SQuAD domain.
 
-Runs EditLens RoBERTa + our InvariantDetector on all samples and reports
-AUROC side-by-side: overall, by domain, by source model, train vs held-out.
+Train domain split: trained on news+creative, never saw wikipedia.
+EditLens: also never trained on our wikipedia samples.
+=> Fair apples-to-apples comparison on a held-out domain.
 
 Usage:
   cd implementation
   PYTHONUTF8=1 modal run evaluation/compare_editlens_modal.py
 
 Output:
-  evaluation/comparison_results.json
+  evaluation/squad_comparison_results.json
 """
 
 import json
 import os
 import modal
 
-# ---------------------------------------------------------------------------
-# Paths (local)
-# ---------------------------------------------------------------------------
-BASE_DIR    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RAW_DIR     = os.path.join(BASE_DIR, "data", "raw")
-GEN_DIR     = os.path.join(BASE_DIR, "generation", "generated")
-AGG_PATH    = os.path.join(BASE_DIR, "features", "extracted", "aggregated.json")
-DETECTOR_PT = os.path.join(BASE_DIR, "training", "detector.pt")
-OUT_PATH    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "comparison_results.json")
-
-EDITLENS_SCRIPTS = os.path.abspath(os.path.join(BASE_DIR, "..", "editlens", "scripts"))
-
-DATASETS         = ["xsum", "writingprompts", "squad"]
-TRAIN_GENERATORS = {"mistral-7b", "qwen-7b"}
-HELD_GENERATORS  = {"gemma-7b", "phi-3-mini", "deepseek-7b"}
+BASE_DIR     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+AGG_PATH     = os.path.join(BASE_DIR, "features", "extracted", "aggregated.json")
+RAW_DIR      = os.path.join(BASE_DIR, "data", "raw")
+GEN_DIR      = os.path.join(BASE_DIR, "generation", "generated")
+DETECTOR_PT  = os.path.join(BASE_DIR, "training", "detector_domain_split.pt")
+OUT_PATH     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "squad_comparison_results.json")
 
 EDITLENS_CHECKPOINT = "pangram/editlens_roberta-large"
 EDITLENS_BASE_MODEL = "FacebookAI/roberta-large"
 
-# ---------------------------------------------------------------------------
-# Modal setup
-# ---------------------------------------------------------------------------
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
@@ -48,138 +37,66 @@ image = (
         "safetensors",
         "scipy",
         "scikit-learn",
-        "emoji",
         "numpy",
         "huggingface_hub",
         "accelerate",
     )
 )
 
-app = modal.App("editlens-comparison", image=image)
+app       = modal.App("editlens-squad-comparison", image=image)
 hf_secret = modal.Secret.from_name("huggingface-secret")
 
-# ---------------------------------------------------------------------------
-# Modal function
-# ---------------------------------------------------------------------------
-@app.function(
-    cpu=4,
-    memory=8192,
-    timeout=3600,
-    secrets=[hf_secret],
-)
-def run_comparison(
-    matched: list[dict],
-    detector_bytes: bytes,
-) -> dict:
+
+@app.function(cpu=4, memory=8192, timeout=3600, secrets=[hf_secret])
+def run_comparison(matched: list[dict], detector_bytes: bytes) -> dict:
     import io
     import numpy as np
     import torch
     import torch.nn as nn
     from sklearn.metrics import roc_auc_score
-    from datasets import Dataset
     from scipy.special import softmax
+    from datasets import Dataset
     from transformers import (
-        AutoModelForSequenceClassification,
-        AutoTokenizer,
-        DataCollatorWithPadding,
-        Trainer,
-        TrainingArguments,
+        AutoModelForSequenceClassification, AutoTokenizer,
+        DataCollatorWithPadding, Trainer, TrainingArguments,
     )
-
-    import re
-    import emoji
-
-    def clean_text(text):
-        text = emoji.demojize(text)
-        if "</think>" in text:
-            text = text.split("</think>")[1].strip()
-        paragraphs = [p for p in text.split("\n") if p.strip()]
-        if paragraphs:
-            first = re.sub(r"^[^a-zA-Z0-9]*", "", paragraphs[0])
-            first = emoji.replace_emoji(first, "")
-            if any(first.startswith(p) for p in ["Sure", "Here", "Abstract", "Title", "I'm happy to help", "Certainly"]):
-                if len(paragraphs) > 1:
-                    text = "\n".join(paragraphs[1:])
-        text = text.lower()
-        text = re.sub(r"\s+", " ", text).strip()
-        return text
 
     # -----------------------------------------------------------------------
     # EditLens inference
     # -----------------------------------------------------------------------
     def run_editlens(texts):
-        print("Loading EditLens tokenizer + model...")
+        print("Loading EditLens...")
         tokenizer = AutoTokenizer.from_pretrained(EDITLENS_BASE_MODEL)
-        model = AutoModelForSequenceClassification.from_pretrained(EDITLENS_CHECKPOINT)
+        model     = AutoModelForSequenceClassification.from_pretrained(EDITLENS_CHECKPOINT)
         model.eval()
 
         n_buckets = model.config.num_labels
         print(f"EditLens n_buckets={n_buckets}")
 
         def tokenize(example):
-            return tokenizer(
-                clean_text(example["text"]),
-                truncation=True,
-                max_length=512,
-            )
+            return tokenizer(example["text"], truncation=True, max_length=512)
 
-        ds = Dataset.from_dict({"text": texts})
-        ds_tok = ds.map(tokenize, num_proc=1)
+        ds_tok = Dataset.from_dict({"text": texts}).map(tokenize, num_proc=1)
 
-        training_args = TrainingArguments(
-            output_dir="/tmp/editlens_inf",
-            per_device_eval_batch_size=16,
-            report_to="none",
-        )
         trainer = Trainer(
             model=model,
-            args=training_args,
+            args=TrainingArguments(
+                output_dir="/tmp/editlens_inf",
+                per_device_eval_batch_size=16,
+                report_to="none",
+            ),
             tokenizer=tokenizer,
             data_collator=DataCollatorWithPadding(tokenizer),
         )
 
         output = trainer.predict(ds_tok)
-        probs = softmax(output.predictions, axis=1)
-        bucket_labels = np.arange(n_buckets)
-        scores = (probs @ bucket_labels) / (n_buckets - 1)
-        return scores.tolist()
+        probs  = softmax(output.predictions, axis=1)
+        return ((probs @ np.arange(n_buckets)) / (n_buckets - 1)).tolist()
 
     # -----------------------------------------------------------------------
-    # Our InvariantDetector inference
+    # Our detector (encoder + classifier only)
     # -----------------------------------------------------------------------
-    class GradientReversal(torch.autograd.Function):
-        @staticmethod
-        def forward(ctx, x, alpha):
-            ctx.alpha = alpha
-            return x
-
-        @staticmethod
-        def backward(ctx, grad):
-            return -ctx.alpha * grad, None
-
-    class InvariantDetector(nn.Module):
-        def __init__(self, input_dim, hidden_dim, repr_dim, n_sources, n_domains):
-            super().__init__()
-            self.encoder = nn.Sequential(
-                nn.Linear(input_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, repr_dim),
-                nn.ReLU(),
-            )
-            self.classifier = nn.Linear(repr_dim, 1)
-            self.src_adversary = nn.Linear(repr_dim, n_sources)
-            self.dom_adversary = nn.Linear(repr_dim, n_domains)
-
-        def forward(self, x, alpha=1.0):
-            u = self.encoder(x)
-            y_hat = self.classifier(u).squeeze(-1)
-            u_rev = GradientReversal.apply(u, alpha)
-            return u, y_hat, self.src_adversary(u_rev), self.dom_adversary(u_rev)
-
     def run_ours(samples):
-        all_sources = sorted({s["source_model"] for s in samples})
-        all_domains = sorted({s["domain"] for s in samples})
-
         feats = []
         for s in samples:
             cz = s["per_model_curvature_z"]
@@ -192,19 +109,25 @@ def run_comparison(
             ])
 
         x = torch.tensor(feats, dtype=torch.float32)
-        model = InvariantDetector(5, 64, 32, len(all_sources), len(all_domains))
-        buf = io.BytesIO(detector_bytes)
-        state = torch.load(buf, map_location="cpu", weights_only=True)
-        model.load_state_dict(state)
+
+        class Detector(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.encoder    = nn.Sequential(nn.Linear(5, 64), nn.ReLU(), nn.Linear(64, 32), nn.ReLU())
+                self.classifier = nn.Linear(32, 1)
+            def forward(self, x):
+                return self.classifier(self.encoder(x)).squeeze(-1)
+
+        model = Detector()
+        state = torch.load(io.BytesIO(detector_bytes), map_location="cpu", weights_only=True)
+        model.load_state_dict(
+            {k: v for k, v in state.items() if k.startswith("encoder") or k.startswith("classifier")},
+            strict=True,
+        )
         model.eval()
-
         with torch.no_grad():
-            _, y_hat, _, _ = model(x)
-            return torch.sigmoid(y_hat).tolist()
+            return torch.sigmoid(model(x)).tolist()
 
-    # -----------------------------------------------------------------------
-    # Run both
-    # -----------------------------------------------------------------------
     texts  = [s["full_text"] for s in matched]
     labels = [s["label"] for s in matched]
 
@@ -214,114 +137,142 @@ def run_comparison(
     print("Running our detector...")
     our_scores = run_ours(matched)
 
-    # -----------------------------------------------------------------------
-    # AUROC reporting
-    # -----------------------------------------------------------------------
-    def auroc(labs, scores):
-        labs, scores = list(labs), list(scores)
-        if len(set(labs)) < 2:
-            return float("nan")
-        return roc_auc_score(labs, scores)
+    el_auroc  = roc_auc_score(labels, editlens_scores)
+    our_auroc = roc_auc_score(labels, our_scores)
 
-    def make_result(labs, el_scores, ou_scores):
-        return {
-            "n": len(labs),
-            "editlens_auroc": auroc(labs, el_scores),
-            "ours_auroc":     auroc(labs, ou_scores),
-        }
+    print(f"\nEditLens AUROC : {el_auroc:.4f}")
+    print(f"Ours AUROC     : {our_auroc:.4f}")
 
-    results = {}
-    results["overall"] = make_result(labels, editlens_scores, our_scores)
-
-    for domain in sorted({s["domain"] for s in matched}):
-        idx = [i for i, s in enumerate(matched) if s["domain"] == domain]
-        results[f"domain_{domain}"] = make_result(
-            [labels[i] for i in idx],
-            [editlens_scores[i] for i in idx],
-            [our_scores[i] for i in idx],
-        )
-
-    for group, gen_set in [("train_generators", TRAIN_GENERATORS), ("held_out_generators", HELD_GENERATORS)]:
-        idx = [i for i, s in enumerate(matched) if s["source_model"] in gen_set]
-        if idx:
-            results[group] = make_result(
-                [labels[i] for i in idx],
-                [editlens_scores[i] for i in idx],
-                [our_scores[i] for i in idx],
-            )
-
-    for src in sorted({s["source_model"] for s in matched if s["source_model"] != "human"}):
-        idx = [i for i, s in enumerate(matched) if s["source_model"] in (src, "human")]
-        results[f"src_{src}"] = make_result(
-            [labels[i] for i in idx],
-            [editlens_scores[i] for i in idx],
-            [our_scores[i] for i in idx],
-        )
-
-    # Attach per-sample scores for saving locally
-    results["_samples"] = [
-        {**s, "editlens_score": editlens_scores[i], "our_score": our_scores[i]}
-        for i, s in enumerate(matched)
-    ]
-
-    return results
+    return {
+        "editlens_auroc": el_auroc,
+        "our_auroc":      our_auroc,
+        "n":              len(matched),
+        "samples": [
+            {**s, "editlens_score": editlens_scores[i], "our_score": our_scores[i]}
+            for i, s in enumerate(matched)
+        ],
+    }
 
 
-# ---------------------------------------------------------------------------
-# Local entrypoint
-# ---------------------------------------------------------------------------
+def find_optimal_threshold(scores, labels, num_thresholds=1000):
+    import numpy as np
+    best_t, best_f1 = 0.0, 0.0
+    for t in np.linspace(0, 1, num_thresholds):
+        preds = (np.array(scores) >= t).astype(int)
+        tp = np.sum((preds == 1) & (np.array(labels) == 1))
+        fp = np.sum((preds == 1) & (np.array(labels) == 0))
+        fn = np.sum((preds == 0) & (np.array(labels) == 1))
+        p  = tp / (tp + fp) if (tp + fp) > 0 else 0
+        r  = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
+        if f1 > best_f1:
+            best_f1, best_t = f1, t
+    return best_t, best_f1
+
+
+def threshold_eval(samples):
+    import random
+    import numpy as np
+    from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, roc_auc_score
+
+    random.seed(42)
+    shuffled = samples[:]
+    random.shuffle(shuffled)
+    split    = len(shuffled) // 2
+    val, test = shuffled[:split], shuffled[split:]
+
+    val_labels, test_labels = [s["label"] for s in val], [s["label"] for s in test]
+    val_el,   test_el   = [s["editlens_score"] for s in val], [s["editlens_score"] for s in test]
+    val_our,  test_our  = [s["our_score"] for s in val],      [s["our_score"] for s in test]
+
+    el_thresh,  el_val_f1  = find_optimal_threshold(val_el,  val_labels)
+    our_thresh, our_val_f1 = find_optimal_threshold(val_our, val_labels)
+
+    def report(name, labels, scores, threshold):
+        preds = (np.array(scores) >= threshold).astype(int)
+        tn, fp, fn, tp = confusion_matrix(labels, preds, labels=[0, 1]).ravel()
+        acc   = accuracy_score(labels, preds)
+        f1    = f1_score(labels, preds, zero_division=0)
+        auroc = roc_auc_score(labels, scores)
+        fpr   = fp / (fp + tn) if (fp + tn) > 0 else 0
+        fnr   = fn / (fn + tp) if (fn + tp) > 0 else 0
+        print(f"\n  {name}  (threshold={threshold:.4f})")
+        print(f"  {'':20} Pred Human   Pred AI")
+        print(f"  {'True Human':20} {tn:>10}   {fp:>7}")
+        print(f"  {'True AI':20} {fn:>10}   {tp:>7}")
+        print(f"  Acc={acc:.3f}  F1={f1:.3f}  AUROC={auroc:.4f}  FPR={fpr:.3f}  FNR={fnr:.3f}")
+        return {"threshold": threshold, "accuracy": acc, "f1": f1, "auroc": auroc,
+                "fpr": fpr, "fnr": fnr, "tp": int(tp), "fp": int(fp), "tn": int(tn), "fn": int(fn)}
+
+    print(f"\n{'='*60}")
+    print(f"WIKIPEDIA/SQUAD  (val={len(val)}, test={len(test)})")
+    print(f"  Val F1 — EditLens: {el_val_f1:.3f} @ {el_thresh:.4f} | "
+          f"Ours: {our_val_f1:.3f} @ {our_thresh:.4f}")
+    print(f"{'='*60}")
+
+    return {
+        "n_val":  len(val),
+        "n_test": len(test),
+        "editlens": {**report("EditLens RoBERTa", test_labels, test_el,  el_thresh), "val_f1": el_val_f1},
+        "ours":     {**report("Ours            ", test_labels, test_our, our_thresh), "val_f1": our_val_f1},
+    }
+
+
 @app.local_entrypoint()
 def main():
-    # Build full-text lookup
+    # Load wikipedia samples from aggregated.json
+    with open(AGG_PATH) as f:
+        agg = json.load(f)
+    wiki = [s for s in agg if s["domain"] == "wikipedia"]
+    print(f"Wikipedia samples in aggregated.json: {len(wiki)}")
+
+    # Build full-text lookup from raw + generated files
     print("Building text lookup...")
     lookup = {}
-    for dataset in DATASETS:
+    for dataset in ["squad"]:
         with open(os.path.join(RAW_DIR, f"{dataset}.json")) as f:
             for s in json.load(f):
                 lookup[s["text"][:100]] = s["text"]
-        dataset_gen_dir = os.path.join(GEN_DIR, dataset)
-        if not os.path.exists(dataset_gen_dir):
+        gen_dataset_dir = os.path.join(GEN_DIR, dataset)
+        if not os.path.exists(gen_dataset_dir):
             continue
-        for fname in os.listdir(dataset_gen_dir):
+        for fname in os.listdir(gen_dataset_dir):
             if not fname.endswith(".json"):
                 continue
-            with open(os.path.join(dataset_gen_dir, fname)) as f:
+            with open(os.path.join(gen_dataset_dir, fname)) as f:
                 for s in json.load(f):
                     lookup[s["generated_text"][:100]] = s["generated_text"]
 
-    # Match aggregated samples to full texts
-    with open(AGG_PATH) as f:
-        agg = json.load(f)
+    # Only keep held-out generators (never seen during training) + human
+    HELD_OUT_GENERATORS = {"gemma-7b", "phi-3-mini", "deepseek-7b"}
+    wiki = [s for s in wiki if s["source_model"] in HELD_OUT_GENERATORS or s["source_model"] == "human"]
+    print(f"After filtering to held-out generators + human: {len(wiki)}")
 
+    # Match curvature samples to full texts
     matched, skipped = [], 0
-    for s in agg:
+    for s in wiki:
         full = lookup.get(s["text_prefix"])
         if full is None:
             skipped += 1
             continue
         matched.append({**s, "full_text": full})
+    print(f"Matched {len(matched)}/{len(wiki)} samples ({skipped} skipped)")
 
-    print(f"Matched {len(matched)} / {len(agg)} samples ({skipped} skipped)")
-
-    # Load detector weights
     with open(DETECTOR_PT, "rb") as f:
         detector_bytes = f.read()
 
-    # Run on Modal
     print("Launching Modal job...")
     results = run_comparison.remote(matched, detector_bytes)
 
-    # Print summary
-    samples = results.pop("_samples")
-    print("\n" + "=" * 70)
-    print("AUROC COMPARISON: EditLens RoBERTa  vs  InvariantDetector (Ours)")
-    print("=" * 70)
-    for key, val in results.items():
-        label = key.replace("_", " ").replace("domain ", "Domain: ").replace("src ", "human vs ")
-        print(f"  {label:<35} n={val['n']:>4}  EditLens={val['editlens_auroc']:.4f}  Ours={val['ours_auroc']:.4f}")
-    print("=" * 70)
+    scored_samples = results.pop("samples")
 
-    results["samples"] = samples
+    print(f"\n{'='*60}")
+    print(f"Wikipedia/SQuAD (n={results['n']})")
+    print(f"  EditLens RoBERTa : AUROC = {results['editlens_auroc']:.4f}")
+    print(f"  Ours             : AUROC = {results['our_auroc']:.4f}")
+
+    results["threshold_eval"] = threshold_eval(scored_samples)
+
     with open(OUT_PATH, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nSaved to {OUT_PATH}")
